@@ -82,20 +82,40 @@ export const flushDocument = async (
 };
 
 export const getYDocFromDb = async (db: PgAdapter, docName: string, flushSize: number) => {
-	const ydoc = new Y.Doc();
-	let updatesCount = 0;
-	await ydoc.transact(async () => {
-		updatesCount = await db.readUpdatesAsCursor(docName, (updates) => {
-			for (let i = 0; i < updates.length; i++) {
-				const valueArr = Uint8Array.from(updates[i].value);
-				Y.applyUpdate(ydoc, valueArr);
-			}
-		});
+	console.log('[getYDocFromDb] start readAllUpdates');
+	const updates: { value: Uint8Array }[] = [];
+	const updatesCount = await db.readAllUpdates(docName, (partial) => {
+		// Buffer를 Uint8Array로 변환하여 저장
+		updates.push(
+			...partial.map((p) => ({
+				value: new Uint8Array(p.value),
+			})),
+		);
 	});
+	console.log(`[getYDocFromDb] readAllUpdates done. total = ${updatesCount}`);
 
+	// 2) 새로운 Doc 생성
+	const ydoc = new Y.Doc();
+
+	// 3) 메모리에 읽어온 업데이트들을 한 번에 apply
+	//    - doc.transact는 동기적으로 처리되므로, 여기서 DB 접속은 하지 않음.
+	ydoc.transact(() => {
+		for (let i = 0; i < updates.length; i++) {
+			const row = updates[i];
+			// row.value는 Buffer이므로, 바로 new Uint8Array(row.value)로 변환 가능
+			const updateArr = row.value;
+			Y.applyUpdate(ydoc, updateArr);
+		}
+	});
+	console.log('[getYDocFromDb] all updates applied to ydoc');
+
+	// 4) flushSize 체크 → 너무 많은 업데이트가 쌓였으면 한 번에 병합
 	if (updatesCount > flushSize) {
+		console.log('[getYDocFromDb] flushDocument start');
 		await flushDocument(db, docName, Y.encodeStateAsUpdate(ydoc), Y.encodeStateVector(ydoc));
+		console.log('[getYDocFromDb] flushDocument done');
 	}
 
+	// 5) 완성된 ydoc 반환
 	return ydoc;
 };

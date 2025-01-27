@@ -1,6 +1,6 @@
 {
-	"name": "y-postgresql",
-	"version": "1.0.0",
+	"name": "y-postgresql-godofkim",
+	"version": "1.0.6",
 	"description": "PostgreSQL database adapter for Yjs",
 	"type": "module",
 	"main": "./dist/y-postgresql.cjs",

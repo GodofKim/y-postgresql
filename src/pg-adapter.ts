@@ -3,25 +3,6 @@ import format from 'pg-format';
 
 const { Pool } = pg;
 
-/*
-    The dataformat is as follows:
-        id: SERIAL PRIMARY KEY,
-        docName: TEXT,
-        value: BYTEA,
-        version: ENUM ('v1', 'v1_sv')
-    The id is used to identify the order of the updates.
-
-    The docName is used to identify the different documents.
-
-    The actual updates to the y-docs are stored in Binary format
-    in the value field.
-
-    The version is used to be able to update this library in the
-    future in a way that is backwards compatible.
-    Also the version is used to distinguish between the document
-    and the state vector.
-*/
-
 type Update = {
 	id: number;
 	docname: string;
@@ -29,6 +10,9 @@ type Update = {
 	version: 'v1';
 };
 
+/**
+ * PgAdapter: PostgreSQL에 Yjs 업데이트를 저장/로드하는 어댑터
+ */
 export class PgAdapter {
 	private tableName: string;
 	private pool: IPool;
@@ -39,84 +23,92 @@ export class PgAdapter {
 	}
 
 	/**
-	 * Create a PostgresqlAdapter instance
-	 * @param connectionOptions
-	 * @param param1
-	 * @param param1.tableName Name of the table where all documents are stored
-	 * @param param1.useIndex Whether to use an index for the table
-	 * @returns
+	 * -----------------------------------------------------------------------------------
+	 * (1) connect()에서 인덱스 생성 논리 포함
+	 * -----------------------------------------------------------------------------------
 	 */
 	static async connect(
 		connectionOptions: PoolConfig,
 		{ tableName, useIndex }: { tableName: string; useIndex: boolean },
 	) {
 		const pool = new Pool(connectionOptions);
+		// 연결 테스트
 		await pool.query('SELECT 1+1;');
 
-		// Create table if it does not exist
+		// 테이블 존재 여부 확인
 		const tableExistsRes = await pool.query(
-			`SELECT EXISTS (
-                SELECT FROM pg_tables
-                WHERE schemaname = 'public'
-                AND tablename  = $1
-            );`,
+			`
+      SELECT EXISTS (
+        SELECT FROM pg_tables
+        WHERE schemaname = 'public'
+          AND tablename  = $1
+      );
+      `,
 			[tableName],
 		);
 		const tableExists = tableExistsRes.rows[0].exists;
 
+		// 테이블이 없으면 생성
 		if (!tableExists) {
+			// enum 타입 생성
 			await pool.query(`
-			DO $$
-			BEGIN
-				IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'ypga_version') THEN
-					CREATE TYPE ypga_version AS ENUM ('v1', 'v1_sv');
-				END IF;
-			END
-			$$;
-			`);
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'ypga_version') THEN
+          CREATE TYPE ypga_version AS ENUM ('v1', 'v1_sv');
+        END IF;
+      END
+      $$;
+      `);
 
+			// yjs-writings 등 사용자 지정 테이블
 			await pool.query(
 				format(
 					`
-                CREATE TABLE %I (
-                    id SERIAL PRIMARY KEY,
-                    docname TEXT NOT NULL,
-                    value BYTEA NOT NULL,
-                    version ypga_version NOT NULL
-                );`,
+          CREATE TABLE %I (
+              id SERIAL PRIMARY KEY,
+              docname TEXT NOT NULL,
+              value BYTEA NOT NULL,
+              version ypga_version NOT NULL
+          );`,
 					tableName,
 				),
 			);
 		}
 
-		// Create index on docName if it does not exist
+		// docName 인덱스 생성
 		if (useIndex) {
-			// 인덱스 이름을 미리 문자열로 만든다. (예: "mytable_docname_idx")
 			const indexName = `${tableName}_docname_idx`;
-
-			// 인덱스 존재 여부 확인
 			const indexExistsRes = await pool.query(
 				`
         SELECT EXISTS (
           SELECT FROM pg_indexes
           WHERE tablename = $1
-          AND indexname = $2
+            AND indexname = $2
         );
         `,
 				[tableName, indexName],
 			);
-
 			const indexDocNameExists = indexExistsRes.rows[0].exists;
 
 			if (!indexDocNameExists) {
-				// 인덱스 직접 문자열로 생성
-				await pool.query(
-					format(
-						'CREATE INDEX %I ON %I (docname);',
-						indexName, // 인덱스 식별자
-						tableName, // 테이블 식별자
-					),
-				);
+				await pool.query(format(`CREATE INDEX %I ON %I (docname);`, indexName, tableName));
+			}
+
+			// (옵션) docname+id 복합 인덱스: 대량 데이터에서 "ORDER BY id"시 더욱 최적화
+			const idx2 = `${tableName}_docname_id_idx`;
+			const idx2Exists = await pool.query(
+				`
+			  SELECT EXISTS (
+			    SELECT FROM pg_indexes
+			    WHERE tablename = $1
+			      AND indexname = $2
+			  );
+			  `,
+				[tableName, idx2],
+			);
+			if (!idx2Exists.rows[0].exists) {
+				await pool.query(format('CREATE INDEX %I ON %I (docname, id);', idx2, tableName));
 			}
 		}
 
@@ -124,17 +116,18 @@ export class PgAdapter {
 	}
 
 	/**
-	 * Find the latest document id in the table. Returns -1 if no document is found.
-	 * @param docName
-	 * @returns
+	 * -----------------------------------------------------------------------------------
+	 * (2) findLatestDocumentId(): 가장 최근(큰 id) 가져오기
+	 * -----------------------------------------------------------------------------------
 	 */
 	async findLatestDocumentId(docName: string) {
 		const query = format(
 			`
-            SELECT id FROM %I
-            WHERE docname = %L
-            ORDER BY id DESC
-            LIMIT 1;`,
+      SELECT id FROM %I
+      WHERE docname = %L
+      AND version = 'v1'
+      ORDER BY id DESC
+      LIMIT 1;`,
 			this.tableName,
 			docName,
 		);
@@ -143,16 +136,17 @@ export class PgAdapter {
 	}
 
 	/**
-	 * Store one update in PostgreSQL.
-	 * @returns {Promise<object>} The stored document
+	 * -----------------------------------------------------------------------------------
+	 * (3) insertUpdate(): 업데이트 1개 row 추가
+	 * -----------------------------------------------------------------------------------
 	 */
 	async insertUpdate(docName: string, value: Uint8Array) {
 		const bufferValue = Buffer.from(value);
 		const query = format(
 			`
-            INSERT INTO %I (docname, value, version)
-            VALUES (%L, %L, 'v1')
-            RETURNING *;`,
+      INSERT INTO %I (docname, value, version)
+      VALUES (%L, %L, 'v1')
+      RETURNING *;`,
 			this.tableName,
 			docName,
 			bufferValue,
@@ -161,13 +155,16 @@ export class PgAdapter {
 		return res.rows[0];
 	}
 
+	/**
+	 * 내부적으로 state vector(버전='v1_sv') 로우 조회
+	 */
 	private async _getStateVector(docName: string) {
 		const query = format(
 			`
-			SELECT value FROM %I
-			WHERE docname = %L
-			AND version = 'v1_sv'
-			LIMIT 1;`,
+      SELECT id, value FROM %I
+      WHERE docname = %L
+        AND version = 'v1_sv'
+      LIMIT 1;`,
 			this.tableName,
 			docName,
 		);
@@ -176,44 +173,44 @@ export class PgAdapter {
 	}
 
 	/**
-	 * Get the state vector of a document in PostgreSQL.
-	 * @param docName
-	 * @returns
+	 * -----------------------------------------------------------------------------------
+	 * (4) getStateVectorBuffer(): docName의 state vector row 조회
+	 * -----------------------------------------------------------------------------------
 	 */
 	async getStateVectorBuffer(docName: string) {
-		const res = await this._getStateVector(docName);
-		return res?.value as Uint8Array | null;
+		const svRow = await this._getStateVector(docName);
+		return svRow?.value as Uint8Array | null;
 	}
 
 	/**
-	 * Upsert the statevector for one document in PostgreSQL.
-	 * @param docName
-	 * @param value
+	 * -----------------------------------------------------------------------------------
+	 * (5) putStateVector(): docName의 state vector를 upsert
+	 * -----------------------------------------------------------------------------------
 	 */
 	async putStateVector(docName: string, value: Uint8Array) {
 		const bufferValue = Buffer.from(value);
-
-		// Get state vector to check if it exists
 		const sv = await this._getStateVector(docName);
 
 		let query;
 		if (sv) {
+			// 기존 row update
 			query = format(
 				`
-				UPDATE %I
-				SET value = %L
-				WHERE id = %L
-				RETURNING *;`,
+        UPDATE %I
+        SET value = %L
+        WHERE id = %L
+        RETURNING *;`,
 				this.tableName,
 				bufferValue,
 				sv.id,
 			);
 		} else {
+			// 새로 삽입
 			query = format(
 				`
-				INSERT INTO %I (docname, value, version)
-				VALUES (%L, %L, 'v1_sv')
-				RETURNING *;`,
+        INSERT INTO %I (docname, value, version)
+        VALUES (%L, %L, 'v1_sv')
+        RETURNING *;`,
 				this.tableName,
 				docName,
 				bufferValue,
@@ -225,19 +222,18 @@ export class PgAdapter {
 	}
 
 	/**
-	 * Delete all updates of one document in a specific range.
-	 * @param docName
-	 * @param from Including this id
-	 * @param to Excluding this id
+	 * -----------------------------------------------------------------------------------
+	 * (6) clearUpdatesRange(): 특정 범위의 updates 삭제
+	 * -----------------------------------------------------------------------------------
 	 */
 	async clearUpdatesRange(docName: string, from: number, to: number) {
 		const query = format(
 			`
-            DELETE FROM %I
-            WHERE docname = %L
-			AND version = 'v1'
-            AND id >= %L
-            AND id < %L;`,
+      DELETE FROM %I
+      WHERE docname = %L
+        AND version = 'v1'
+        AND id >= %L
+        AND id < %L;`,
 			this.tableName,
 			docName,
 			from,
@@ -247,59 +243,86 @@ export class PgAdapter {
 	}
 
 	/**
-	 * Get all document updates for a specific document as a cursor.
+	 * -----------------------------------------------------------------------------------
+	 * (7) readAllUpdates(): docName에 해당하는 모든 'v1' 업데이트를 한번에 가져오기
+	 *     기존 readUpdatesAsCursor()의 LIMIT+OFFSET 반복 대신,
+	 *     단일 쿼리로 모두 읽어 callback에 넘김 → 대량 데이터시 OFFSET 문제 해결
+	 * -----------------------------------------------------------------------------------
 	 */
-	async readUpdatesAsCursor(docName: string, callback: (records: Update[]) => void) {
-		let offset = 0;
-		const limit = 100;
-		let rowsCount = 0;
-		let rows = [];
+	async readAllUpdates(docName: string, callback: (records: Update[]) => void) {
+		// 한 번에 가져올 레코드 수
+		const BATCH_SIZE = 1000;
+		let lastId = -1;
+		let totalCount = 0;
 
-		do {
+		while (true) {
 			const query = format(
 				`
-            SELECT * FROM %I
-            WHERE docname = %L
-            AND version = 'v1'
-            ORDER BY id
-            LIMIT %L OFFSET %L;`,
+				SELECT id, docname, value
+				FROM %I
+				WHERE docname = %L
+					AND version = 'v1'
+					AND id > %L
+				ORDER BY id
+				LIMIT %L;
+				`,
 				this.tableName,
 				docName,
-				limit,
-				offset,
+				lastId,
+				BATCH_SIZE,
 			);
 
-			// eslint-disable-next-line no-await-in-loop
+			console.log(`[query] readAllUpdates batch (lastId: ${lastId})`);
 			const res = await this.pool.query(query);
-			rows = res.rows;
 
-			rowsCount += rows.length;
+			if (res.rows.length === 0) {
+				break;
+			}
+
+			const rows = res.rows.map((row) => ({
+				id: row.id,
+				docname: row.docname,
+				value: row.value,
+				version: 'v1' as const,
+			}));
+
+			lastId = rows[rows.length - 1].id;
+			totalCount += rows.length;
+
+			// 배치 단위로 콜백 호출
 			callback(rows);
 
-			offset += limit;
-		} while (rows.length === limit);
+			// 마지막 배치라면 종료
+			if (rows.length < BATCH_SIZE) {
+				break;
+			}
+		}
 
-		return rowsCount;
+		return totalCount;
 	}
 
 	/**
-	 * Delete a document, and all associated data from the database.
+	 * -----------------------------------------------------------------------------------
+	 * (8) deleteDocument(): 하나의 docName 전체 row 삭제
+	 * -----------------------------------------------------------------------------------
 	 */
 	async deleteDocument(docName: string) {
 		const query = format(
 			`
-                DELETE FROM %I
-                WHERE docname = %L
-                RETURNING *;`,
+      DELETE FROM %I
+      WHERE docname = %L
+      RETURNING *;`,
 			this.tableName,
 			docName,
 		);
 		const res = await this.pool.query(query);
-		return res.rows[0];
+		return res.rows;
 	}
 
 	/**
-	 * Close the connection to the database.
+	 * -----------------------------------------------------------------------------------
+	 * (9) close(): Pool 종료
+	 * -----------------------------------------------------------------------------------
 	 */
 	async close() {
 		await this.pool.end();
