@@ -91,23 +91,30 @@ export class PgAdapter {
 
 		// Create index on docName if it does not exist
 		if (useIndex) {
-			const indexDocNameExistsRes = await pool.query(
-				`SELECT EXISTS (
-                    SELECT FROM pg_indexes
-                    WHERE tablename = $1
-                    AND indexname = $1_docname_idx
-                );`,
-				[tableName],
+			// 인덱스 이름을 미리 문자열로 만든다. (예: "mytable_docname_idx")
+			const indexName = `${tableName}_docname_idx`;
+
+			// 인덱스 존재 여부 확인
+			const indexExistsRes = await pool.query(
+				`
+        SELECT EXISTS (
+          SELECT FROM pg_indexes
+          WHERE tablename = $1
+          AND indexname = $2
+        );
+        `,
+				[tableName, indexName],
 			);
-			const indexDocNameExists = indexDocNameExistsRes.rows[0].exists;
+
+			const indexDocNameExists = indexExistsRes.rows[0].exists;
 
 			if (!indexDocNameExists) {
+				// 인덱스 직접 문자열로 생성
 				await pool.query(
 					format(
-						`
-                CREATE INDEX %I_docname_idx ON %I (docname);`,
-						tableName,
-						tableName,
+						'CREATE INDEX %I ON %I (docname);',
+						indexName, // 인덱스 식별자
+						tableName, // 테이블 식별자
 					),
 				);
 			}
