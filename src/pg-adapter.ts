@@ -250,55 +250,30 @@ export class PgAdapter {
 	 * -----------------------------------------------------------------------------------
 	 */
 	async readAllUpdates(docName: string, callback: (records: Update[]) => void) {
-		// 한 번에 가져올 레코드 수
-		const BATCH_SIZE = 1000;
-		let lastId = -1;
-		let totalCount = 0;
+		const query = format(
+			`
+      SELECT id, docname, value
+      FROM %I
+      WHERE docname = %L
+        AND version = 'v1'
+      ORDER BY id;`,
+			this.tableName,
+			docName,
+		);
 
-		while (true) {
-			const query = format(
-				`
-				SELECT id, docname, value
-				FROM %I
-				WHERE docname = %L
-					AND version = 'v1'
-					AND id > %L
-				ORDER BY id
-				LIMIT %L;
-				`,
-				this.tableName,
-				docName,
-				lastId,
-				BATCH_SIZE,
-			);
+		console.log('[query] readAllUpdates', new Date().toISOString());
 
-			console.log(`[query] readAllUpdates batch (lastId: ${lastId})`);
-			const res = await this.pool.query(query);
+		const res = await this.pool.query(query);
+		console.log('[res] readAllUpdates', new Date().toISOString());
 
-			if (res.rows.length === 0) {
-				break;
-			}
-
-			const rows = res.rows.map((row) => ({
-				id: row.id,
-				docname: row.docname,
-				value: row.value,
-				version: 'v1' as const,
-			}));
-
-			lastId = rows[rows.length - 1].id;
-			totalCount += rows.length;
-
-			// 배치 단위로 콜백 호출
-			callback(rows);
-
-			// 마지막 배치라면 종료
-			if (rows.length < BATCH_SIZE) {
-				break;
-			}
-		}
-
-		return totalCount;
+		const rows = res.rows.map((row) => ({
+			id: row.id,
+			docname: row.docname,
+			value: row.value, // Buffer -> Uint8Array로 변환 시점은 callback에서 처리 가능
+			version: 'v1' as const,
+		}));
+		callback(rows);
+		return rows.length;
 	}
 
 	/**

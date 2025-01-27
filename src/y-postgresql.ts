@@ -144,7 +144,6 @@ export class PostgresqlPersistence {
 	 * @return {Promise<Y.Doc>}
 	 */
 	getYDoc(docName: string) {
-		console.log('[getYDoc] start');
 		return this._transact(docName, async (db) => {
 			return getYDocFromDb(db, docName, this.flushSize);
 		});

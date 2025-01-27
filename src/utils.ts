@@ -82,40 +82,40 @@ export const flushDocument = async (
 };
 
 export const getYDocFromDb = async (db: PgAdapter, docName: string, flushSize: number) => {
-	console.log('[getYDocFromDb] start readAllUpdates');
-	const updates: { value: Uint8Array }[] = [];
-	const updatesCount = await db.readAllUpdates(docName, (partial) => {
-		// Buffer를 Uint8Array로 변환하여 저장
-		updates.push(
-			...partial.map((p) => ({
-				value: new Uint8Array(p.value),
-			})),
-		);
-	});
-	console.log(`[getYDocFromDb] readAllUpdates done. total = ${updatesCount}`);
+	console.log('[getYDocFromDb] start');
 
-	// 2) 새로운 Doc 생성
+	// 1) 새로운 Doc 미리 생성
 	const ydoc = new Y.Doc();
 
-	// 3) 메모리에 읽어온 업데이트들을 한 번에 apply
-	//    - doc.transact는 동기적으로 처리되므로, 여기서 DB 접속은 하지 않음.
-	ydoc.transact(() => {
-		for (let i = 0; i < updates.length; i++) {
-			const row = updates[i];
-			// row.value는 Buffer이므로, 바로 new Uint8Array(row.value)로 변환 가능
-			const updateArr = row.value;
-			Y.applyUpdate(ydoc, updateArr);
+	// 2) 스트리밍 방식으로 업데이트 적용
+	let batchCount = 0;
+	await db.readAllUpdates(docName, (partial) => {
+		// 배치 단위로 트랜잭션 처리
+		ydoc.transact(
+			() => {
+				for (const p of partial) {
+					Y.applyUpdate(ydoc, new Uint8Array(p.value));
+				}
+			},
+			null,
+			true,
+		); // 세 번째 파라미터 true: 원격 변경사항으로 처리
+
+		batchCount++;
+		if (batchCount % 10 === 0) {
+			console.log(`[getYDocFromDb] processed ${batchCount} batches`);
 		}
 	});
-	console.log('[getYDocFromDb] all updates applied to ydoc');
 
-	// 4) flushSize 체크 → 너무 많은 업데이트가 쌓였으면 한 번에 병합
-	if (updatesCount > flushSize) {
-		console.log('[getYDocFromDb] flushDocument start');
-		await flushDocument(db, docName, Y.encodeStateAsUpdate(ydoc), Y.encodeStateVector(ydoc));
-		console.log('[getYDocFromDb] flushDocument done');
+	// 3) flushSize 체크 - 비동기로 처리
+	const totalUpdates = batchCount * 1000; // BATCH_SIZE = 1000 기준
+	if (totalUpdates > flushSize) {
+		console.log('[getYDocFromDb] starting async flush');
+		flushDocument(db, docName, Y.encodeStateAsUpdate(ydoc), Y.encodeStateVector(ydoc))
+			.then(() => console.log('[getYDocFromDb] async flush complete'))
+			.catch((err) => console.error('[getYDocFromDb] flush error:', err));
 	}
 
-	// 5) 완성된 ydoc 반환
+	console.log('[getYDocFromDb] complete');
 	return ydoc;
 };
