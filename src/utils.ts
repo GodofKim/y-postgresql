@@ -54,12 +54,17 @@ export const getCurrentUpdateClock = async (db: PgAdapter, docName: string) =>
  */
 export const storeUpdate = async (db: PgAdapter, docName: string, update: Uint8Array) => {
 	const clock = await getCurrentUpdateClock(db, docName);
+
+	// 최초 상태벡터 생성을 비동기로 처리
 	if (clock === -1) {
-		// make sure that a state vector is always written, so we can search for available documents
-		const ydoc = new Y.Doc();
-		Y.applyUpdate(ydoc, update);
-		const sv = Y.encodeStateVector(ydoc);
-		await writeStateVector(db, docName, sv, 0);
+		Promise.resolve()
+			.then(async () => {
+				const ydoc = new Y.Doc();
+				Y.applyUpdate(ydoc, update);
+				const sv = Y.encodeStateVector(ydoc);
+				await writeStateVector(db, docName, sv, 0);
+			})
+			.catch((err) => console.error('[storeUpdate] Failed to write initial state vector:', err));
 	}
 
 	const storedDoc = await db.insertUpdate(docName, update);

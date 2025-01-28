@@ -141,18 +141,33 @@ export class PgAdapter {
 	 * -----------------------------------------------------------------------------------
 	 */
 	async insertUpdate(docName: string, value: Uint8Array) {
-		const bufferValue = Buffer.from(value);
-		const query = format(
-			`
-      INSERT INTO %I (docname, value, version)
-      VALUES (%L, %L, 'v1')
-      RETURNING *;`,
-			this.tableName,
-			docName,
-			bufferValue,
-		);
-		const res = await this.pool.query(query);
-		return res.rows[0];
+		// 1. 커넥션 풀링 최적화
+		const client = await this.pool.connect();
+
+		try {
+			// 2. 트랜잭션 사용
+			await client.query('BEGIN');
+
+			const bufferValue = Buffer.from(value);
+			const query = format(
+				`INSERT INTO %I (docname, value, version)
+				 VALUES (%L, %L, 'v1')
+				 RETURNING id;`, // 3. 필요한 컬럼만 반환
+				this.tableName,
+				docName,
+				bufferValue,
+			);
+
+			const res = await client.query(query);
+			await client.query('COMMIT');
+
+			return { id: res.rows[0].id };
+		} catch (error) {
+			await client.query('ROLLBACK');
+			throw error;
+		} finally {
+			client.release();
+		}
 	}
 
 	/**
